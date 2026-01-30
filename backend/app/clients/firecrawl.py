@@ -23,17 +23,22 @@ async def scrape_article(url: str) -> dict[str, Any]:
     if not settings.firecrawl_api_key:
         raise FireCrawlError("FIRECRAWL_API_KEY is not set.")
 
-    endpoint = f"{settings.firecrawl_api_base.rstrip('/')}/v2/scrape"
+    endpoint = f"{settings.firecrawl_api_base.rstrip('/')}/v1/scrape"
     headers = {"Authorization": f"Bearer {settings.firecrawl_api_key}", "Content-Type": "application/json"}
     payload = {
         "url": url,
         "formats": ["markdown", "html"],
-        "onlyMainContent": True,
         "includeTags": ["article", "main"],
         "excludeTags": ["nav", "footer", "aside"],
-        "waitFor": 1500,
+        "onlyMainContent": True,
         "timeout": 45000,
+        "waitFor": 1500,
         "blockAds": True,
+        "blockCookieBanners": True,
+        "extractorOptions": {
+            "mode": "article",
+            "includeImages": True,
+        },
     }
 
     async with httpx.AsyncClient(timeout=60) as client:

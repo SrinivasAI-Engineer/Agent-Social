@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class CreateExecutionRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
     url: str = Field(min_length=8)
 
 
@@ -33,8 +34,4 @@ class HitlActionsRequest(BaseModel):
     regenerate_linkedin: Optional[bool] = False
     edited_twitter: Optional[str] = ""
     edited_linkedin: Optional[str] = ""
-    twitter_connection_id: Optional[int] = None  # which Twitter account to post to
-    linkedin_connection_id: Optional[int] = None  # which LinkedIn account to post to
-    # Optional: base64 image bytes from frontend (browser can load when server returns 403)
-    image_base64: Optional[str] = None
 

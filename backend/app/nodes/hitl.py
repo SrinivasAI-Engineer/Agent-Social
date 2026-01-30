@@ -25,16 +25,8 @@ def apply_hitl_actions(state: AgentState, actions: dict[str, Any]) -> AgentState
         "regenerate_linkedin": _normalize_bool(actions.get("regenerate_linkedin")),
         "edited_twitter": (actions.get("edited_twitter") or "").strip(),
         "edited_linkedin": (actions.get("edited_linkedin") or "").strip(),
-        "twitter_connection_id": actions.get("twitter_connection_id"),
-        "linkedin_connection_id": actions.get("linkedin_connection_id"),
         "acted_at": now_iso(),
     }
-    if actions.get("twitter_connection_id") is not None:
-        state["twitter_connection_id"] = actions["twitter_connection_id"]
-    if actions.get("linkedin_connection_id") is not None:
-        state["linkedin_connection_id"] = actions["linkedin_connection_id"]
-    if actions.get("image_base64"):
-        state.setdefault("image_metadata", {})["image_base64"] = actions["image_base64"]
 
     # Apply independent edits (one must not affect the other)
     if state["hitl_actions"]["edited_twitter"]:

@@ -3,10 +3,7 @@ from __future__ import annotations
 import re
 
 from app.llm import SYSTEM_PROMPT, get_llm
-from app.logging import get_logger
 from app.state import AgentState, now_iso
-
-logger = get_logger(__name__)
 
 
 def _simple_relevance(text: str) -> float:
@@ -22,9 +19,6 @@ async def analyze_content(state: AgentState) -> AgentState:
     if state.get("terminated"):
         return state
 
-    execution_id = state.get("execution_id", "unknown")
-    logger.info(f"Starting content analysis for execution_id={execution_id}")
-
     scraped = state.get("scraped_content") or {}
     text = (scraped.get("text") or "").strip()
     title = (scraped.get("title") or "").strip()
@@ -34,10 +28,6 @@ async def analyze_content(state: AgentState) -> AgentState:
     tone = "informative"
 
     llm = get_llm()
-    if llm:
-        logger.info(f"Using LLM for analysis, execution_id={execution_id}")
-    else:
-        logger.info(f"Using simple heuristic for analysis, execution_id={execution_id}")
     if llm:
         prompt = (
             "Analyze this article and return JSON with keys: "
@@ -87,13 +77,10 @@ async def analyze_content(state: AgentState) -> AgentState:
         }
 
     # Guard: low relevance terminates by default (can be changed to interrupt in future)
-    relevance_score = state["analysis_result"].get("relevance_score") or 0.0
-    if relevance_score < 0.35:
-        logger.warning(f"Content relevance too low ({relevance_score:.2f}) for execution_id={execution_id}, terminating")
+    if (state["analysis_result"].get("relevance_score") or 0.0) < 0.35:
         state["terminated"] = True
-        state["terminate_reason"] = f"Content relevance too low ({relevance_score:.2f}); not a suitable article/blog."
+        state["terminate_reason"] = "Content relevance too low; not a suitable article/blog."
 
     state["updated_at"] = now_iso()
-    logger.info(f"Content analysis completed for execution_id={execution_id}, relevance={state['analysis_result'].get('relevance_score', 0)}")
     return state
 

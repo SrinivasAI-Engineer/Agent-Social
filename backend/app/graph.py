@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.nodes.analyze import analyze_content
@@ -31,8 +30,7 @@ async def generate_linkedin_only(state: AgentState) -> AgentState:
 from app.publish import publish_linkedin, publish_twitter, upload_image  # noqa: E402
 
 
-def build_graph(checkpointer=None):
-    """Build the LangGraph. If checkpointer is provided (e.g. SqliteSaver), checkpoints persist across restarts."""
+def build_graph(checkpoints_path: str = "agentsocials.checkpoints.db"):
     builder = StateGraph(AgentState)
 
     builder.add_node("ingest_url", ingest_url)
@@ -94,12 +92,10 @@ def build_graph(checkpointer=None):
     builder.add_edge("publish_twitter", "publish_linkedin")
     builder.add_edge("publish_linkedin", END)
 
-    # Persistent checkpointer when provided (e.g. from main.py startup); else in-memory.
-    # Execution state is also persisted to DB on interrupt and on submit_actions.
-    if checkpointer is not None:
-        return builder.compile(checkpointer=checkpointer)
-    memory = MemorySaver()
-    return builder.compile(checkpointer=memory)
+    # In-memory checkpointer (sufficient for local/dev). Our own DB layer persists
+    # state snapshots around interrupts; for fully durable LangGraph checkpoints
+    # you can swap this for a DB-backed saver later.
+    return builder.compile(checkpointer=True)
 
 
 def get_interrupt_payload(result: dict[str, Any]) -> Optional[dict[str, Any]]:

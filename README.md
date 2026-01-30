@@ -47,7 +47,5 @@ Frontend runs at `http://localhost:5173`.
 ## Documentation
 
 - Backend details: `backend/README.md`
-- **MCP Publishing Server (creation, tools, run):** `backend/mcp_publish/README.md`
-- **Migration (MCP + persistence, all updates):** `backend/docs/MIGRATION_MCP_AND_PERSISTENCE.md`
 - Frontend details: `frontend/README.md`
 

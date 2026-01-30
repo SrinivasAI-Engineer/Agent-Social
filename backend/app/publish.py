@@ -1,17 +1,11 @@
-"""
-LangGraph publishing nodes — delegate to MCP only.
-
-No platform API calls. No OAuth/token access. State and routing only; execution via MCP.
-"""
-
 from __future__ import annotations
 
-import base64
 from typing import Any
 
 import httpx
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential
 
+from app.db import get_tokens
 from app.logging import get_logger
 from app.state import AgentState, now_iso
 
@@ -21,55 +15,24 @@ logger = get_logger(__name__)
 def _image_is_from_scrape(state: AgentState, url: str) -> bool:
     imgs = (state.get("scraped_content") or {}).get("images") or []
     for im in imgs:
-        src = (im.get("src") or im.get("url") or "") if isinstance(im, dict) else (im if isinstance(im, str) else "")
-        if src and str(src).strip() == url.strip():
+        src = str(im.get("src") or im.get("url") or "")
+        if src and src == url:
             return True
     return False
 
 
-def _origin_referer(url: str) -> str:
-    """Return scheme + netloc for use as Referer when article referer gets 403."""
-    try:
-        from urllib.parse import urlparse
-        p = urlparse(url)
-        if p.scheme and p.netloc:
-            return f"{p.scheme}://{p.netloc}/"
-    except Exception:
-        pass
-    return ""
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError)),
-)
-async def _download_bytes(url: str, referer: str | None = None) -> bytes:
-    """Download image bytes. Tries article referer first, then image origin (CDNs often allow same-origin)."""
-    origin_ref = _origin_referer(url)
-    headers_base = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-    }
-    last_response = None
-    for ref in (referer, origin_ref):
-        headers = {**headers_base, "Referer": ref} if ref else headers_base.copy()
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(url, follow_redirects=True, headers=headers)
-            last_response = r
-            if r.status_code == 403 and ref != origin_ref:
-                continue  # retry with image-origin referer
-            r.raise_for_status()
-            return r.content
-    if last_response is not None:
-        last_response.raise_for_status()
-    raise RuntimeError("Image download failed (403)")
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+async def _download_bytes(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, follow_redirects=True)
+        r.raise_for_status()
+        return r.content
 
 
 async def upload_image(state: AgentState) -> AgentState:
     """
     Upload image ONLY after explicit human approval (enforced by routing).
-    Delegates to MCP upload_media for Twitter and LinkedIn.
+    Attempts Twitter + LinkedIn uploads; failures do not auto-terminate publishing.
     """
     if state.get("terminated"):
         return state
@@ -82,59 +45,70 @@ async def upload_image(state: AgentState) -> AgentState:
         return state
 
     if not _image_is_from_scrape(state, image_url):
+        # Prevent tampering: only allow image URLs that were extracted from the article.
         logger.warning("Blocked image upload: URL not in scraped image set.")
         state.setdefault("media_ids", {})
         state["updated_at"] = now_iso()
         return state
 
-    # Use stored bytes from select_image when present; else download with Referer
-    blob: bytes | None = None
-    if img.get("image_base64"):
-        try:
-            blob = base64.b64decode(img["image_base64"])
-        except Exception:
-            pass
-    if not blob:
-        article_url = (state.get("url") or "").strip()
-        try:
-            blob = await _download_bytes(image_url, referer=article_url or None)
-        except Exception as e:
-            logger.warning("Image download failed (%s), publishing text-only: %s", image_url[:60], e)
-            state.setdefault("media_ids", {})
-            state["updated_at"] = now_iso()
-            return state
-
+    blob = await _download_bytes(image_url)
     state.setdefault("media_ids", {})
-    user_id = (state.get("user_id") or "").strip()
-    if not user_id:
-        state["updated_at"] = now_iso()
-        return state
 
-    from mcp_publish.client import call_upload_media
-
-    media_b64 = base64.b64encode(blob).decode("ascii")
-    cid_tw = state.get("twitter_connection_id")
-    cid_li = state.get("linkedin_connection_id")
-    if cid_tw is not None:
-        cid_tw = int(cid_tw)
-    if cid_li is not None:
-        cid_li = int(cid_li)
-
+    # Upload to Twitter (best-effort)
     try:
-        res_tw = await call_upload_media("twitter", media_b64, user_id, cid_tw, image_url)
-        if res_tw.get("media_id"):
-            state["media_ids"]["twitter_media_id"] = res_tw["media_id"]
-        elif res_tw.get("error"):
-            logger.warning("Twitter image upload failed: %s", res_tw["error"][:200])
+        tw = get_tokens(state["user_id"], "twitter") or {}
+        access_token = tw.get("access_token")
+        if access_token:
+            # Twitter media upload is historically v1.1; many setups accept Bearer user token.
+            async with httpx.AsyncClient(timeout=45) as client:
+                r = await client.post(
+                    "https://upload.twitter.com/1.1/media/upload.json",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    files={"media": ("image.jpg", blob)},
+                )
+                if r.status_code < 400:
+                    media_id = str(r.json().get("media_id_string") or r.json().get("media_id") or "")
+                    if media_id:
+                        state["media_ids"]["twitter_media_id"] = media_id
+                else:
+                    logger.warning("Twitter image upload failed: %s %s", r.status_code, r.text[:300])
     except Exception:
         logger.exception("Twitter image upload error")
 
+    # Upload to LinkedIn (best-effort; requires person_urn in token payload)
     try:
-        res_li = await call_upload_media("linkedin", media_b64, user_id, cid_li, image_url)
-        if res_li.get("media_id"):
-            state["media_ids"]["linkedin_asset_urn"] = res_li["media_id"]
-        elif res_li.get("error"):
-            logger.warning("LinkedIn image upload failed: %s", res_li["error"][:200])
+        li = get_tokens(state["user_id"], "linkedin") or {}
+        access_token = li.get("access_token")
+        owner = li.get("person_urn")  # e.g. "urn:li:person:xxxx"
+        if access_token and owner:
+            headers = {"Authorization": f"Bearer {access_token}", "X-Restli-Protocol-Version": "2.0.0"}
+            register_body = {
+                "registerUploadRequest": {
+                    "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+                    "owner": owner,
+                    "serviceRelationships": [{"relationshipType": "OWNER", "identifier": "urn:li:userGeneratedContent"}],
+                }
+            }
+            async with httpx.AsyncClient(timeout=45) as client:
+                reg = await client.post(
+                    "https://api.linkedin.com/v2/assets?action=registerUpload",
+                    headers=headers | {"Content-Type": "application/json"},
+                    json=register_body,
+                )
+                if reg.status_code >= 400:
+                    raise RuntimeError(f"LinkedIn registerUpload failed: {reg.status_code} {reg.text}")
+                reg_json = reg.json()
+                asset = reg_json.get("value", {}).get("asset")
+                upload_url = (
+                    (reg_json.get("value", {}).get("uploadMechanism", {}) or {})
+                    .get("com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest", {})
+                    .get("uploadUrl")
+                )
+                if asset and upload_url:
+                    up = await client.put(upload_url, content=blob, headers={"Authorization": f"Bearer {access_token}"})
+                    if up.status_code >= 400:
+                        raise RuntimeError(f"LinkedIn upload failed: {up.status_code} {up.text}")
+                    state["media_ids"]["linkedin_asset_urn"] = str(asset)
     except Exception:
         logger.exception("LinkedIn image upload error")
 
@@ -142,30 +116,7 @@ async def upload_image(state: AgentState) -> AgentState:
     return state
 
 
-def _connection_id(state: AgentState, key: str) -> int | None:
-    v = state.get(key)
-    if v is None:
-        return None
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _user_friendly_error(platform: str, err: str) -> str:
-    if not err:
-        return f"{platform} publish failed."
-    if "402" in err or "CreditsDepleted" in err:
-        return "Twitter API credits depleted. Add credits in your X Developer account (developer.x.com) or try again later."
-    if "401" in err:
-        return f"{platform} token expired. In Connections, disconnect and add again to get a fresh token, then try publishing again."
-    if "No connection" in err or "Missing" in err:
-        return err
-    return err[:300]
-
-
 async def publish_twitter(state: AgentState) -> AgentState:
-    """Publish to Twitter via MCP only. No API or token access here."""
     if state.get("terminated"):
         return state
 
@@ -179,35 +130,36 @@ async def publish_twitter(state: AgentState) -> AgentState:
         state["updated_at"] = now_iso()
         return state
 
-    user_id = (state.get("user_id") or "").strip()
-    if not user_id:
-        state["publish_status"]["twitter"] = "failed"
-        state["publish_status"]["last_error"] = "Missing user_id."
+    tw = get_tokens(state["user_id"], "twitter") or {}
+    access_token = tw.get("access_token")
+    if not access_token:
+        state["terminated"] = True
+        state["terminate_reason"] = "Missing Twitter access token."
         state["updated_at"] = now_iso()
         return state
 
-    connection_id = _connection_id(state, "twitter_connection_id")
+    payload: dict[str, Any] = {"text": text}
     media_id = (state.get("media_ids") or {}).get("twitter_media_id")
-
-    from mcp_publish.client import call_publish_post
+    if media_id:
+        payload["media"] = {"media_ids": [media_id]}
 
     try:
-        result = await call_publish_post("twitter", text, user_id, connection_id, media_id, None)
-        status = result.get("status") or "failure"
-        if status == "success":
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.twitter.com/2/tweets",
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            if r.status_code >= 400:
+                raise RuntimeError(f"Twitter publish failed: {r.status_code} {r.text}")
+            tweet_id = str((r.json().get("data") or {}).get("id") or "")
             state["publish_status"]["twitter"] = "published"
-            if result.get("post_id"):
-                state["publish_status"]["tweet_id"] = result["post_id"]
-        else:
-            state["publish_status"]["twitter"] = "failed"
-            state["publish_status"]["last_error"] = _user_friendly_error("Twitter", result.get("error") or "")
-            if "402" in (result.get("error") or "") or "CreditsDepleted" in (result.get("error") or ""):
-                logger.warning("Twitter publish: 402 CreditsDepleted")
-            else:
-                logger.warning("Twitter publish failed: %s", result.get("error", "")[:200])
+            if tweet_id:
+                state["publish_status"]["tweet_id"] = tweet_id
     except Exception as e:
         state["publish_status"]["twitter"] = "failed"
-        state["publish_status"]["last_error"] = _user_friendly_error("Twitter", str(e))
+        state["publish_status"]["last_error"] = str(e)
+        # Do not auto-terminate; LinkedIn may still proceed.
         logger.exception("Twitter publish error")
 
     state["updated_at"] = now_iso()
@@ -215,7 +167,6 @@ async def publish_twitter(state: AgentState) -> AgentState:
 
 
 async def publish_linkedin(state: AgentState) -> AgentState:
-    """Publish to LinkedIn via MCP only. No API or token access here."""
     if state.get("terminated"):
         return state
 
@@ -229,36 +180,54 @@ async def publish_linkedin(state: AgentState) -> AgentState:
         state["updated_at"] = now_iso()
         return state
 
-    user_id = (state.get("user_id") or "").strip()
-    if not user_id:
-        state["publish_status"]["linkedin"] = "failed"
-        state["publish_status"]["last_error"] = "Missing user_id."
+    li = get_tokens(state["user_id"], "linkedin") or {}
+    access_token = li.get("access_token")
+    author = li.get("person_urn")  # "urn:li:person:xxxx"
+    if not access_token or not author:
+        state["terminated"] = True
+        state["terminate_reason"] = "Missing LinkedIn access token or person_urn."
         state["updated_at"] = now_iso()
         return state
 
-    connection_id = _connection_id(state, "linkedin_connection_id")
-    metadata: dict[str, Any] = {}
     asset = (state.get("media_ids") or {}).get("linkedin_asset_urn")
+    share = {
+        "author": author,
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {"text": text},
+                "shareMediaCategory": "IMAGE" if asset else "NONE",
+            }
+        },
+        "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+    }
     if asset:
-        metadata["linkedin_asset_urn"] = asset
-
-    from mcp_publish.client import call_publish_post
+        share["specificContent"]["com.linkedin.ugc.ShareContent"]["media"] = [
+            {"status": "READY", "description": {"text": ""}, "media": asset, "title": {"text": ""}}
+        ]
 
     try:
-        result = await call_publish_post("linkedin", text, user_id, connection_id, None, metadata)
-        status = result.get("status") or "failure"
-        if status == "success":
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.linkedin.com/v2/ugcPosts",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                },
+                json=share,
+            )
+            if r.status_code >= 400:
+                raise RuntimeError(f"LinkedIn publish failed: {r.status_code} {r.text}")
+            post_urn = r.headers.get("x-restli-id") or ""
             state["publish_status"]["linkedin"] = "published"
-            if result.get("post_id"):
-                state["publish_status"]["linkedin_post_urn"] = result["post_id"]
-        else:
-            state["publish_status"]["linkedin"] = "failed"
-            state["publish_status"]["last_error"] = _user_friendly_error("LinkedIn", result.get("error") or "")
-            logger.warning("LinkedIn publish failed: %s", result.get("error", "")[:200])
+            if post_urn:
+                state["publish_status"]["linkedin_post_urn"] = post_urn
     except Exception as e:
         state["publish_status"]["linkedin"] = "failed"
-        state["publish_status"]["last_error"] = _user_friendly_error("LinkedIn", str(e))
+        state["publish_status"]["last_error"] = str(e)
         logger.exception("LinkedIn publish error")
 
     state["updated_at"] = now_iso()
     return state
+

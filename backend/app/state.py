@@ -8,7 +8,6 @@ class ImageMetadata(TypedDict, total=False):
     image_url: str
     caption: str
     source: str  # e.g. "firecrawl"
-    image_base64: str  # optional: from frontend or select_image when host allows
 
 
 class MediaIds(TypedDict, total=False):
