@@ -5,7 +5,7 @@ __pycache__/
 *.so
 .Python
 env/
-venv/
+venvAS/
 ENV/
 build/
 develop-eggs/
@@ -67,3 +67,7 @@ htmlcov/
 *.sublime-project
 *.sublime-workspace
 *.iml
+
+__pycache__/
+*.pyc
+
